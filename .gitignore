@@ -1,0 +1,37 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Tool output. Migration bundles contain a real environment: the exported image
+# tar (several GB), the workspace archive, the host/hardware inventory and the
+# git state of every workspace repository. None of that belongs in the
+# repository, and none of it is safe to publish.
+migration_bundle_*/
+*.tar
+*.tar.zst
+*.tar.gz
+
+# Inspection reports written with `docker-migration inspect --output`: they
+# record the real container, mounts, env var names, devices and host details.
+inspection*.json
+*_inspection.json
+
+# Internal development reports. These are kept locally on purpose - they are
+# the record of how v1 was built and validated against a real environment, so
+# they quote real image tags, container and workspace names, host paths, a
+# hardware inventory (UID/GID, device GIDs, NIC name, partial device serials)
+# and real dry-run transcripts. They are excluded rather than deleted; move
+# them under docs/development/ if you want them tracked in a private repo.
+docker_migration_tool_v1_*.md
+repository_publication_audit.md
+docs/development/
+docs/internal/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
