@@ -333,11 +333,38 @@ bundle に格納されるもの。
 
 ## インストール
 
+### Ubuntu 22.04
+
 ```bash
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
 pip install -e .
 ```
+
+### Ubuntu 24.04（PEP 668 対応システム）
+
+Ubuntu 24.04 以降、または PEP 668（externally-managed-environment）を強制する
+システムでは、先に仮想環境を作成してください。
+
+```bash
+# 前提パッケージのインストール
+sudo apt install -y python3-venv python3-pip git zstd
+
+# リポジトリのクローンと移動
+git clone <your-remote-url> docker-migration-tool
+cd docker-migration-tool
+
+# 仮想環境の作成と有効化
+python3 -m venv .venv
+source .venv/bin/activate
+
+# インストール
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+これで `error: externally-managed-environment` を回避できます。
+`--break-system-packages` は**使用しないでください**。
 
 `docker-migration` コマンドがインストールされます。開発時は
 `pip install -e ".[dev]"` を使ってください。
@@ -480,6 +507,18 @@ workspace アーカイブの展開 → 可搬 Docker 設定の復元 → udev �
 移行元マシンのパスが移行先のパスとして再利用されることはありません。無人実行では
 `--non-interactive` を使います（プロンプトはスキップされ、該当する作業は手動作業として
 報告されます）。
+
+### `--workspace` の意味
+
+`--workspace` は workspace を復元する**ファイルシステム上のパス**を指定します。
+workspace の論理的な名前（identity）を変更するものではありません。移行元 manifest の
+`workspace_name` はそのまま `MANIFEST.json` に保持され、出自の追跡に使われます。
+コンテナ名や compose project 名は、復元先パスの basename ではなく、元の
+`workspace_name` から導出されます。
+
+同じ workspace を 1 台のマシン上で異なる identity で複数動かす必要がある場合は、
+import 後に `env.sh` / `docker-compose.yml` の `CONTAINER_NAME` /
+`COMPOSE_PROJECT_NAME` を手動で編集してください。
 
 ## 移行フロー
 
@@ -726,7 +765,7 @@ symlink による脱出、デバイスノードを拒否します。
 ## テスト
 
 ```bash
-python -m pytest                       # 296 tests
+python -m pytest                       # 308 tests
 python -m pytest --collect-only -q     # collection only
 python -m pytest tests/test_security.py
 ```

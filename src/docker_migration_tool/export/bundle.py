@@ -11,6 +11,7 @@ that cannot be safely removed without a rebuild. Instead, v1 exports:
 
 import json
 import os
+import re
 import shutil
 import tarfile
 from dataclasses import asdict
@@ -983,7 +984,16 @@ class BundleCreator:
         log_ok("Package manifests saved")
 
     def _export_docker_config(self) -> None:
-        """Export portable Docker configuration."""
+        """Export portable Docker configuration.
+
+        P0 FIX: The exported env.sh is normalized so that any
+        RUNTIME_IMAGE_TAG_OVERRIDE pointing to a source snapshot is replaced
+        with the proven clean parent image. This ensures the bundle is
+        self-consistent: import always uses the image the bundle provides.
+
+        P1 FIX: All portable config files are checksummed and recorded in
+        MANIFEST.json so bundle verify / import preflight can detect tampering.
+        """
         log_step("Exporting Docker configuration...")
 
         if not self.inspection.docker_config:
@@ -1002,10 +1012,18 @@ class BundleCreator:
             ("dockerignore_path", ".dockerignore"),
         ]
 
+        # Track which files were copied for checksumming
+        copied_files: list[tuple[str, Path]] = []
+
         for attr, filename in portable_attrs:
             src_path = getattr(self.inspection.docker_config, attr)
             if src_path and Path(src_path).exists():
-                shutil.copy(src_path, config_dir / filename)
+                dst_path = config_dir / filename
+                shutil.copy(src_path, dst_path)
+                copied_files.append((f"docker/config/{filename}", dst_path))
+
+        # P0 FIX: Normalize env.sh to use clean parent image instead of snapshot
+        self._normalize_env_sh_runtime_image(config_dir / "env.sh")
 
         # Copy udev rules
         if self.inspection.docker_config.udev_rules_path:
@@ -1059,7 +1077,88 @@ class BundleCreator:
             f.write("These files are host-specific and must be regenerated on\n")
             f.write("User B's machine by running config.sh\n")
 
+        # P1 FIX: Checksum all portable config files for integrity verification
+        self._checksum_portable_config(config_dir, copied_files)
+
         log_ok("Docker configuration saved")
+
+    def _normalize_env_sh_runtime_image(self, env_sh_path: Path) -> None:
+        """Normalize env.sh so runtime image points to the clean parent.
+
+        P0 FIX: If the source env.sh has RUNTIME_IMAGE_TAG_OVERRIDE pointing to
+        a snapshot, the target would try to run an image that doesn't exist in
+        the bundle. This rewrites the file so the bundle is self-consistent.
+
+        The source_runtime_image (the snapshot) is recorded in MANIFEST.json
+        for audit purposes but is never used as a runtime target.
+        """
+        if not env_sh_path.exists():
+            return
+
+        clean_image = self.manifest.clean_base_image
+        if not clean_image:
+            return
+
+        content = env_sh_path.read_text(encoding="utf-8")
+        original = content
+
+        # Pattern: export RUNTIME_IMAGE_TAG_OVERRIDE="..." or RUNTIME_IMAGE_TAG_OVERRIDE="..."
+        # We replace the value with the clean parent image
+        patterns = [
+            (r'(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*"[^"]*"',
+             f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
+             f'export RUNTIME_IMAGE_TAG_OVERRIDE="{clean_image}"'),
+            (r"(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*'[^']*'",
+             f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
+             f"export RUNTIME_IMAGE_TAG_OVERRIDE='{clean_image}'"),
+            # Unquoted assignment (less common but possible)
+            (r'(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*(\S+)',
+             f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
+             f'export RUNTIME_IMAGE_TAG_OVERRIDE="{clean_image}"'),
+        ]
+
+        for pattern, replacement in patterns:
+            content, count = re.subn(pattern, replacement, content, count=1)
+            if count > 0:
+                break
+
+        if content != original:
+            env_sh_path.write_text(content, encoding="utf-8")
+            log_info(f"  env.sh: normalized RUNTIME_IMAGE_TAG_OVERRIDE -> {clean_image}")
+
+    def _checksum_portable_config(self, config_dir: Path,
+                                   copied_files: list[tuple[str, Path]]) -> None:
+        """Compute and record checksums for portable config files.
+
+        P1 FIX: These checksums let bundle verify and import preflight detect
+        tampering with configuration files that affect import behavior.
+        """
+        # Add checksums for the main config files
+        for rel_path, abs_path in copied_files:
+            if abs_path.exists():
+                sha256 = compute_sha256_file(abs_path)
+                self.checksums[rel_path] = sha256
+                self.manifest.checksums[rel_path] = sha256
+
+        # Also checksum udev rules and scripts if present
+        extra_files = [
+            ("docker/config/udev/99-robotics-docker.rules",
+             config_dir / "udev" / "99-robotics-docker.rules"),
+            ("docker/config/install_host_udev_rules.sh",
+             config_dir / "install_host_udev_rules.sh"),
+            ("docker/config/install_user_xauthority_sync.sh",
+             config_dir / "install_user_xauthority_sync.sh"),
+            ("docker/config/xauthority/sync-robotics-xauthority.sh",
+             config_dir / "xauthority" / "sync-robotics-xauthority.sh"),
+            ("docker/config/xauthority/robotics-docker-xauthority.desktop.in",
+             config_dir / "xauthority" / "robotics-docker-xauthority.desktop.in"),
+        ]
+
+        for rel_path, abs_path in extra_files:
+            if abs_path.exists():
+                sha256 = compute_sha256_file(abs_path)
+                self.checksums[rel_path] = sha256
+                self.manifest.checksums[rel_path] = sha256
 
     def _export_host_info(self) -> None:
         """Export host information."""

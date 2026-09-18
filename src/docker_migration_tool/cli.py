@@ -438,13 +438,19 @@ def cmd_import(args: argparse.Namespace) -> int:
     )
 
     if result.success:
-        log_header("Import Complete")
-        log_ok(f"Workspace: {result.workspace_path}")
+        # P1 FIX: Different completion message for dry-run vs real import
+        if args.dry_run:
+            log_header("Dry Run Complete")
+            log_ok(f"Planned workspace: {result.workspace_path}")
+            log_info("No changes were made")
+        else:
+            log_header("Import Complete")
+            log_ok(f"Workspace: {result.workspace_path}")
 
-        if result.manual_actions_required:
-            log_warn("\nManual actions required:")
-            for action in result.manual_actions_required:
-                log_info(f"  • {action}")
+            if result.manual_actions_required:
+                log_warn("\nManual actions required:")
+                for action in result.manual_actions_required:
+                    log_info(f"  • {action}")
 
         return 0
     else:

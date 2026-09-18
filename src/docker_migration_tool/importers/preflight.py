@@ -68,6 +68,7 @@ class PreflightChecker:
         self._check_gpu()
         self._check_nvidia_toolkit()
         self._check_bundle_security_metadata()
+        self._check_runtime_image_consistency()  # P0 FIX
         self._validate_bundle()
 
         passed = len(self.errors) == 0
@@ -348,6 +349,113 @@ class PreflightChecker:
                 "passed (config scanner "
                 f"{metadata.get('config_scanner_version', 'unknown')})",
             )
+
+    def _check_runtime_image_consistency(self) -> None:
+        """P0 FIX: Verify the bundle's config uses the image the bundle provides.
+
+        The clean image recorded in MANIFEST.json / IMAGE_INFO.json must match
+        what the portable Docker config (env.sh) will actually use at runtime.
+        If env.sh has a RUNTIME_IMAGE_TAG_OVERRIDE pointing to a source snapshot
+        that the bundle doesn't contain, import would fail or use the wrong image.
+
+        Since export now normalizes RUNTIME_IMAGE_TAG_OVERRIDE, this should pass.
+        If it fails, the bundle was created by an older tool version or tampered.
+        """
+        log_step("Checking runtime image consistency...")
+
+        # Get the clean image from manifest
+        clean_image = self.manifest.get("clean_base_image")
+        if not clean_image:
+            self.warnings.append(
+                "No clean_base_image in manifest - cannot verify runtime consistency"
+            )
+            self._add_check(
+                "runtime_image_consistency", False,
+                "No clean_base_image in manifest", "warning",
+            )
+            return
+
+        # Parse env.sh to find what runtime image would actually be used
+        env_sh_path = self.bundle_path / "docker" / "config" / "env.sh"
+        if not env_sh_path.exists():
+            # No env.sh - rely on defaults in common.sh/config.sh
+            self._add_check(
+                "runtime_image_consistency", True,
+                f"No env.sh override - bundle uses {clean_image}",
+            )
+            return
+
+        resolved_runtime = self._resolve_runtime_image_from_config(env_sh_path)
+
+        if resolved_runtime is None:
+            # Could not determine - not a hard error, just a warning
+            self._add_check(
+                "runtime_image_consistency", True,
+                "Could not determine runtime image from config; assuming clean parent",
+            )
+            return
+
+        if resolved_runtime == clean_image:
+            self._add_check(
+                "runtime_image_consistency", True,
+                f"Config runtime image matches bundle: {clean_image}",
+            )
+        else:
+            self.errors.append(
+                f"Runtime image configuration references an image that is not "
+                f"supplied by this bundle. Bundle provides: {clean_image}, "
+                f"but config specifies: {resolved_runtime}. This bundle may have "
+                f"been created by an older tool version or tampered with."
+            )
+            self._add_check(
+                "runtime_image_consistency", False,
+                f"Mismatch: bundle={clean_image}, config={resolved_runtime}", "error",
+            )
+
+    def _resolve_runtime_image_from_config(self, env_sh_path: Path) -> str | None:
+        """Parse env.sh to find the effective runtime image.
+
+        Looks for RUNTIME_IMAGE_TAG_OVERRIDE first (the override), then falls
+        back to IMAGE_TAG or LOCAL_BASE_TAG constructions.
+
+        Returns:
+            The resolved image tag, or None if undeterminable
+        """
+        import re
+
+        try:
+            content = env_sh_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        # Look for RUNTIME_IMAGE_TAG_OVERRIDE first (takes precedence)
+        patterns = [
+            r'RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*"([^"]+)"',
+            r"RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*'([^']+)'",
+            r'RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*(\S+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if match:
+                value = match.group(1)
+                # Skip if it's a variable reference like ${VAR}
+                if not value.startswith("$"):
+                    return value
+
+        # Fall back to IMAGE_TAG or LOCAL_BASE_TAG
+        for var in ["IMAGE_TAG", "LOCAL_BASE_TAG"]:
+            for pattern in [
+                rf'{var}\s*=\s*"([^"]+)"',
+                rf"{var}\s*=\s*'([^']+)'",
+                rf'{var}\s*=\s*(\S+)',
+            ]:
+                match = re.search(pattern, content)
+                if match:
+                    value = match.group(1)
+                    if not value.startswith("$"):
+                        return value
+
+        return None
 
     def _validate_bundle(self) -> None:
         """Validate bundle structure and checksums."""

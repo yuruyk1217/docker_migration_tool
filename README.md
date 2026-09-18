@@ -343,11 +343,38 @@ On both machines:
 
 ## Installation
 
+### Ubuntu 22.04
+
 ```bash
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
 pip install -e .
 ```
+
+### Ubuntu 24.04 (and other PEP 668 systems)
+
+On Ubuntu 24.04+ or any system that enforces PEP 668 (externally-managed-environment),
+create a virtual environment first:
+
+```bash
+# Install prerequisites
+sudo apt install -y python3-venv python3-pip git zstd
+
+# Clone and enter the repository
+git clone <your-remote-url> docker-migration-tool
+cd docker-migration-tool
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+This avoids the `error: externally-managed-environment` message. Do **not** use
+`--break-system-packages`.
 
 This installs the `docker-migration` entry point. For development, use
 `pip install -e ".[dev]"`.
@@ -492,6 +519,18 @@ Target workspace resolution, in order:
 No path from the source machine is ever reused as a target path. Use
 `--non-interactive` for unattended runs (prompts are skipped and the
 corresponding actions are reported as manual follow-ups instead).
+
+### `--workspace` semantics
+
+`--workspace` specifies the **filesystem path** where the workspace is restored.
+It does not rename the workspace's logical identity: the `workspace_name` from
+the source manifest is preserved in `MANIFEST.json` for provenance tracking.
+Container names and compose project names are derived from the original
+`workspace_name`, not from the target path's basename.
+
+If you need to run multiple copies of the same workspace on one machine with
+different identities, you would need to edit `env.sh` / `docker-compose.yml`
+post-import to change `CONTAINER_NAME` / `COMPOSE_PROJECT_NAME`.
 
 ## Migration Workflow
 
@@ -740,7 +779,7 @@ Two rules worth knowing before changing code:
 ## Tests
 
 ```bash
-python -m pytest                       # 296 tests
+python -m pytest                       # 308 tests
 python -m pytest --collect-only -q     # collection only
 python -m pytest tests/test_security.py
 ```

@@ -92,9 +92,13 @@ class BundleRestorer:
         log_ok("Preflight checks passed")
 
         if self.dry_run:
+            # P1 FIX: Determine workspace path BEFORE dry-run report so we can
+            # show the planned target rather than "None"
+            self._determine_workspace_path()
             self._dry_run_report()
             return ImportResult(
                 success=True,
+                workspace_path=str(self.target_workspace) if self.target_workspace else None,
                 verifications=self.verifications,
                 warnings=["Dry run - no changes made"],
             )
@@ -180,7 +184,8 @@ class BundleRestorer:
         """Report what would be done in dry run."""
         log_header("Dry Run Report")
 
-        log_info(f"Would restore to: {self.target_workspace}")
+        # P1 FIX: Show the planned workspace path clearly
+        log_info(f"Planned workspace: {self.target_workspace}")
 
         # Image
         image = self.manifest.get("clean_base_image")
