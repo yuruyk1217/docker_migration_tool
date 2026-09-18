@@ -333,26 +333,29 @@ bundle に格納されるもの。
 
 ## インストール
 
-### Ubuntu 22.04
+### 前提パッケージ（Ubuntu / Debian）
 
 ```bash
-git clone <your-remote-url> docker-migration-tool
-cd docker-migration-tool
-pip install -e .
+sudo apt update
+sudo apt install -y python3-venv python3-pip git zstd
 ```
 
-### Ubuntu 24.04（PEP 668 対応システム）
-
-Ubuntu 24.04 以降、または PEP 668（externally-managed-environment）を強制する
-システムでは、先に仮想環境を作成してください。
+**Ubuntu 24.04** で仮想環境の作成が `ensurepip is not available` のようなメッセージで
+失敗する場合は、バージョン固有のパッケージをインストールしてください。
 
 ```bash
-# 前提パッケージのインストール
-sudo apt install -y python3-venv python3-pip git zstd
+sudo apt install -y python3.12-venv
+```
 
-# リポジトリのクローンと移動
+### docker-migration-tool のインストール
+
+```bash
+# リポジトリをクローン
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
+
+# 以前の失敗した venv があれば削除
+rm -rf .venv
 
 # 仮想環境の作成と有効化
 python3 -m venv .venv
@@ -363,11 +366,26 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-これで `error: externally-managed-environment` を回避できます。
-`--break-system-packages` は**使用しないでください**。
+### インストール後の使用方法
 
-`docker-migration` コマンドがインストールされます。開発時は
-`pip install -e ".[dev]"` を使ってください。
+CLI は仮想環境内にインストールされます。**新しいターミナルを開くたびに**、
+ツールを使用する前に仮想環境を有効化してください。
+
+```bash
+cd ~/docker-migration-tool
+source .venv/bin/activate
+docker-migration --version
+```
+
+Ubuntu 24.04 で `error: externally-managed-environment` が表示される場合は、
+仮想環境の外で `pip` を実行しています。`--break-system-packages` は
+**使用しないでください**。`.venv` を有効化して `python -m pip` を使ってください。
+
+開発用依存関係のインストール：
+
+```bash
+python -m pip install -e ".[dev]"
+```
 
 ## CLI
 

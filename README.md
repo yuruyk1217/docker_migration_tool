@@ -343,26 +343,29 @@ On both machines:
 
 ## Installation
 
-### Ubuntu 22.04
+### Prerequisites (Ubuntu / Debian)
 
 ```bash
-git clone <your-remote-url> docker-migration-tool
-cd docker-migration-tool
-pip install -e .
+sudo apt update
+sudo apt install -y python3-venv python3-pip git zstd
 ```
 
-### Ubuntu 24.04 (and other PEP 668 systems)
-
-On Ubuntu 24.04+ or any system that enforces PEP 668 (externally-managed-environment),
-create a virtual environment first:
+On **Ubuntu 24.04**, if virtual environment creation fails with a message like
+`ensurepip is not available`, install the version-specific package:
 
 ```bash
-# Install prerequisites
-sudo apt install -y python3-venv python3-pip git zstd
+sudo apt install -y python3.12-venv
+```
 
-# Clone and enter the repository
+### Install docker-migration-tool
+
+```bash
+# Clone the repository
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
+
+# Remove any failed previous venv attempt
+rm -rf .venv
 
 # Create and activate a virtual environment
 python3 -m venv .venv
@@ -373,11 +376,26 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-This avoids the `error: externally-managed-environment` message. Do **not** use
-`--break-system-packages`.
+### Using the tool after installation
 
-This installs the `docker-migration` entry point. For development, use
-`pip install -e ".[dev]"`.
+The CLI is installed inside the virtual environment. **Every time you open a new
+terminal**, activate the environment before using the tool:
+
+```bash
+cd ~/docker-migration-tool
+source .venv/bin/activate
+docker-migration --version
+```
+
+On Ubuntu 24.04, if you see `error: externally-managed-environment`, you are
+running `pip` outside the virtual environment. Do **not** use
+`--break-system-packages`; activate `.venv` and use `python -m pip` instead.
+
+For development dependencies:
+
+```bash
+python -m pip install -e ".[dev]"
+```
 
 ## CLI
 
