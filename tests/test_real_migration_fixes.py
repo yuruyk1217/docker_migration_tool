@@ -129,7 +129,7 @@ export ROS_DOMAIN_ID="1"
         (src_docker / "env.sh").write_text(env_sh_content)
 
         # Create minimal docker-compose.yml and other files
-        (src_docker / "docker-compose.yml").write_text("version: '3'\n")
+        (src_docker / "docker-compose.yml").write_text("services:\n  app:\n    image: ubuntu:22.04\n")
         (src_docker / "Dockerfile").write_text("FROM ubuntu:22.04\n")
 
         # Create inspection result
@@ -192,7 +192,7 @@ export UBUNTU_VERSION="22.04"
 export ROS_DOMAIN_ID="1"
 '''
         (src_docker / "env.sh").write_text(env_sh_content)
-        (src_docker / "docker-compose.yml").write_text("version: '3'\n")
+        (src_docker / "docker-compose.yml").write_text("services:\n  app:\n    image: ubuntu:22.04\n")
         (src_docker / "Dockerfile").write_text("FROM ubuntu:22.04\n")
 
         inspection = make_inspection(workspace_path=str(src_workspace))
@@ -335,7 +335,7 @@ class TestPortableConfigChecksum:
         (src_docker / "env.sh").write_text("export FOO=bar\n")
         (src_docker / "common.sh").write_text("# common\n")
         (src_docker / "config.sh").write_text("# config\n")
-        (src_docker / "docker-compose.yml").write_text("version: '3'\n")
+        (src_docker / "docker-compose.yml").write_text("services:\n  app:\n    image: ubuntu:22.04\n")
         (src_docker / "Dockerfile").write_text("FROM ubuntu:22.04\n")
 
         inspection = make_inspection(workspace_path=str(src_workspace))
@@ -391,7 +391,7 @@ class TestPortableConfigChecksum:
         src_docker.mkdir(parents=True)
 
         (src_docker / "env.sh").write_text("export FOO=bar\n")
-        (src_docker / "docker-compose.yml").write_text("version: '3'\n")
+        (src_docker / "docker-compose.yml").write_text("services:\n  app:\n    image: ubuntu:22.04\n")
         (src_docker / "Dockerfile").write_text("FROM ubuntu:22.04\n")
 
         inspection = make_inspection(workspace_path=str(src_workspace))

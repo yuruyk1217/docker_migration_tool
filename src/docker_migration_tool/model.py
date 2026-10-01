@@ -395,6 +395,11 @@ class BundleManifest:
     container_name: str | None = None
     # Image info
     source_runtime_image: str | None = None  # The snapshot (NOT exported)
+    portable_base_image: str | None = None
+    runtime_image_rebuild_required: bool = False
+    runtime_build_context: str | None = None
+    runtime_build_dockerfile: str | None = None
+    runtime_build_service: str | None = None
     clean_base_image: str | None = None      # The clean parent (exported)
     clean_base_image_id: str | None = None
     clean_base_image_digest: str | None = None
@@ -443,6 +448,7 @@ class InspectionResult:
     git_repos: list[GitRepoInfo] = field(default_factory=list)
     packages: PackageManifest | None = None
     docker_config: PortableDockerConfig | None = None
+    runtime_build: dict | None = None
     network_intents: list[NetworkIntent] = field(default_factory=list)
     secrets: list[SecretFinding] = field(default_factory=list)
     large_files: list[LargeFile] = field(default_factory=list)
@@ -467,6 +473,8 @@ class VerificationResult:
 class ImportResult:
     """Result of import operation."""
     success: bool
+    completed_stages: list[str] = field(default_factory=list)
+    failed_stage: str | None = None
     workspace_path: str | None = None
     container_name: str | None = None
     verifications: list[VerificationResult] = field(default_factory=list)

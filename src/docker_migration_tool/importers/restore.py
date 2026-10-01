@@ -12,7 +12,12 @@ from pathlib import Path
 from docker_migration_tool.model import ImportResult, VerificationResult
 from docker_migration_tool.importers.preflight import run_preflight
 from docker_migration_tool.utils.docker import docker_load, run_docker, run_docker_compose, DockerError
-from docker_migration_tool.utils.filesystem import safe_extract_archive, ensure_directory
+from docker_migration_tool.utils.filesystem import (
+    ensure_directory,
+    read_file_manifest,
+    safe_extract_archive,
+    verify_file_manifest,
+)
 from docker_migration_tool.utils.logging import (
     log_ok, log_warn, log_error, log_info, log_step, log_header,
 )
@@ -57,6 +62,8 @@ class BundleRestorer:
         self.warnings: list[str] = []
         self.errors: list[str] = []
         self.manual_actions: list[str] = []
+        self.completed_stages: list[str] = []
+        self.failed_stage: str | None = None
 
     def _load_manifest(self) -> dict:
         """Load bundle manifest."""
@@ -85,20 +92,20 @@ class BundleRestorer:
                 log_error(f"  {error}")
             return ImportResult(
                 success=False,
+                failed_stage="preflight",
                 verifications=self.verifications,
                 errors=preflight.errors,
             )
 
         log_ok("Preflight checks passed")
+        self.completed_stages.append("preflight")
 
         if self.dry_run:
-            # P1 FIX: Determine workspace path BEFORE dry-run report so we can
-            # show the planned target rather than "None"
             self._determine_workspace_path()
             self._dry_run_report()
             return ImportResult(
                 success=True,
-                workspace_path=str(self.target_workspace) if self.target_workspace else None,
+                workspace_path=str(self.target_workspace),
                 verifications=self.verifications,
                 warnings=["Dry run - no changes made"],
             )
@@ -108,13 +115,19 @@ class BundleRestorer:
             self._determine_workspace_path()
 
             # Load image
+            self.failed_stage = "image_load"
             self._load_image()
+            self.completed_stages.append("image_load")
 
             # Restore workspace
+            self.failed_stage = "workspace_restore"
             self._restore_workspace()
+            self.completed_stages.append("workspace_restore")
 
             # Restore Docker config
+            self.failed_stage = "docker_config_restore"
             self._restore_docker_config()
+            self.completed_stages.append("docker_config_restore")
 
             # Setup udev (requires sudo)
             self._setup_udev()
@@ -123,19 +136,41 @@ class BundleRestorer:
             self._setup_xauthority()
 
             # Regenerate host-specific config
+            self.failed_stage = "host_config_regeneration"
             self._regenerate_config()
+            if self.errors:
+                raise RuntimeError("Host config regeneration failed: " + self.errors[-1])
+            if self.manifest.get("runtime_image_rebuild_required") and not (
+                self.target_workspace / "docker" / ".env").is_file():
+                raise RuntimeError("Host config regeneration failed: .env missing")
+            self.completed_stages.append("host_config_regeneration")
 
             # Handle ROS domain ID
             self._handle_ros_domain_id()
 
             # Start container and restore dependencies
-            self._restore_dependencies()
+            self.failed_stage = "container_start/dependency_restore"
+            dependencies_restored = self._restore_dependencies()
+
+            if self.errors:
+                raise RuntimeError("Required import stage failed: " + self.errors[-1])
+            if dependencies_restored:
+                self.completed_stages.append("dependency_restore")
+
+            self.failed_stage = "post_import_verification"
+            running = run_docker_compose(
+                ["ps", "--status", "running", "-q"],
+                cwd=self.target_workspace / "docker", timeout=30)
+            if not running.stdout.strip():
+                raise RuntimeError("No running Compose container after import")
+            self.completed_stages.append("post_import_verification")
 
             # Add manual actions
             self._collect_manual_actions()
 
             return ImportResult(
                 success=True,
+                completed_stages=self.completed_stages,
                 workspace_path=str(self.target_workspace),
                 container_name=self.manifest.get("container_name"),
                 verifications=self.verifications,
@@ -148,6 +183,8 @@ class BundleRestorer:
             self.errors.append(str(e))
             return ImportResult(
                 success=False,
+                completed_stages=self.completed_stages,
+                failed_stage=self.failed_stage,
                 workspace_path=str(self.target_workspace) if self.target_workspace else None,
                 verifications=self.verifications,
                 errors=self.errors,
@@ -184,13 +221,17 @@ class BundleRestorer:
         """Report what would be done in dry run."""
         log_header("Dry Run Report")
 
-        # P1 FIX: Show the planned workspace path clearly
-        log_info(f"Planned workspace: {self.target_workspace}")
+        log_info(f"Would restore to: {self.target_workspace}")
 
         # Image
         image = self.manifest.get("clean_base_image")
         if image:
-            log_info(f"Would load image: {image}")
+            log_info(f"Would load portable base: {image}")
+        if self.manifest.get("runtime_image_rebuild_required"):
+            log_info("Runtime rebuild required: yes")
+            log_info("Would rebuild target runtime image using "
+                     + str(self.manifest.get("runtime_build_dockerfile")))
+            log_info("Target identity/runtime image: generated by config.sh")
 
         # Workspace
         log_info("Would extract workspace archive")
@@ -254,13 +295,49 @@ class BundleRestorer:
         # Extract archive
         safe_extract_archive(archive_path, src_path)
 
-        log_ok(f"Workspace restored to: {src_path}")
+        # New bundles checksum a per-file manifest of the archived files (the
+        # checksum itself was validated by preflight). Legacy bundles without
+        # one are restored in compatible mode, as before.
+        file_manifest = "workspace/src.sha256"
+        if file_manifest not in self.manifest.get("checksums", {}):
+            log_warn("Bundle has no workspace file manifest (legacy bundle); "
+                     "per-file verification skipped")
+            self.verifications.append(VerificationResult(
+                name="workspace_restored",
+                passed=True,
+                status="warning",
+                message=f"Workspace restored to {src_path} "
+                        "(legacy bundle: no per-file manifest)",
+            ))
+            return
+
+        entries = read_file_manifest(self.bundle_path / file_manifest)
+        missing, mismatched = verify_file_manifest(src_path, entries)
+        if missing or mismatched:
+            for rel_path in missing:
+                log_error(f"  Missing after restore: {rel_path}")
+            for rel_path in mismatched:
+                log_error(f"  Hash mismatch after restore: {rel_path}")
+            self.verifications.append(VerificationResult(
+                name="workspace_restored",
+                passed=False,
+                status="error",
+                message=f"Workspace restore incomplete: {len(missing)} missing, "
+                        f"{len(mismatched)} hash mismatch",
+                details={"missing": missing, "mismatched": mismatched},
+            ))
+            raise ValueError(
+                "Workspace restore does not match workspace/src.sha256: "
+                + ", ".join(missing + mismatched)
+            )
+
+        log_ok(f"Workspace restored to: {src_path} ({len(entries)} files verified)")
 
         self.verifications.append(VerificationResult(
             name="workspace_restored",
             passed=True,
             status="ok",
-            message=f"Workspace restored to {src_path}",
+            message=f"Workspace restored to {src_path} ({len(entries)} files verified)",
         ))
 
     def _restore_docker_config(self) -> None:
@@ -288,6 +365,37 @@ class BundleRestorer:
                 # Make scripts executable
                 if filename.endswith(".sh"):
                     os.chmod(docker_dir / filename, 0o755)
+
+        # New bundles checksum every context file. Restore precisely those
+        # paths; do not copy unverified or host generated files from the bundle.
+        from docker_migration_tool.security.scanner import is_generated_config, is_secret_path
+        for relative in self.manifest.get("checksums", {}):
+            prefix = "docker/config/"
+            if not relative.startswith(prefix):
+                continue
+            subpath = Path(relative[len(prefix):])
+            if subpath.is_absolute() or ".." in subpath.parts:
+                raise ValueError(f"Invalid Docker config path: {relative}")
+            if any(is_generated_config(part) or is_secret_path(part)[0]
+                   for part in subpath.parts):
+                raise ValueError(f"Sensitive Docker config path: {relative}")
+            src = self.bundle_path / relative
+            dst = docker_dir / subpath
+            ensure_directory(dst.parent)
+            shutil.copy2(src, dst)
+
+        context_root = self.bundle_path / "workspace" / "build_context"
+        if context_root.exists():
+            for relative in self.manifest.get("checksums", {}):
+                prefix = "workspace/build_context/"
+                if not relative.startswith(prefix):
+                    continue
+                subpath = Path(relative[len(prefix):])
+                if subpath.is_absolute() or ".." in subpath.parts:
+                    raise ValueError(f"Invalid build context path: {relative}")
+                dst = self.target_workspace / subpath
+                ensure_directory(dst.parent)
+                shutil.copy2(self.bundle_path / relative, dst)
 
         # Copy udev directory
         udev_src = config_src / "udev"
@@ -395,7 +503,10 @@ class BundleRestorer:
         config_script = docker_dir / "config.sh"
 
         if not config_script.exists():
-            self.warnings.append("config.sh not found - cannot regenerate .env")
+            if self.manifest.get("runtime_image_rebuild_required"):
+                self.errors.append("Host config regeneration failed: config.sh missing")
+            else:
+                self.warnings.append("config.sh not found - cannot regenerate .env")
             log_warn("config.sh not found")
             return
 
@@ -425,13 +536,13 @@ class BundleRestorer:
                         message=".env and override regenerated",
                     ))
                 else:
-                    self.warnings.append("config.sh ran but files not created")
+                    self.errors.append("Host config regeneration failed: generated files missing")
                     log_warn("Generated config files not found")
             else:
-                self.warnings.append(f"config.sh failed: {result.stderr}")
+                self.errors.append(f"Host config regeneration failed: {result.stderr}")
                 log_warn(f"config.sh failed: {result.stderr[:200]}")
         except subprocess.TimeoutExpired:
-            self.warnings.append("config.sh timed out")
+            self.errors.append("Host config regeneration timed out")
             log_warn("config.sh timed out")
 
     def _handle_ros_domain_id(self) -> None:
@@ -477,57 +588,47 @@ class BundleRestorer:
                 env_sh.write_text(content)
                 log_ok(f"ROS_DOMAIN_ID updated to {new_id}")
 
-    def _restore_dependencies(self) -> None:
+    def _restore_dependencies(self) -> bool:
         """Start container and restore dependencies."""
         log_step("Starting container and restoring dependencies...")
 
         docker_dir = self.target_workspace / "docker"
 
-        # Check for install script
+        # Legacy/minimal workspaces may not need an automatic installer.
         install_script = self.target_workspace / "src" / "_container_setup" / "install_workspace_dependencies.sh"
-        if not install_script.exists():
-            self.errors.append(
-                "Dependency restore strategy unavailable: "
-                "install_workspace_dependencies.sh not found"
-            )
-            log_error("install_workspace_dependencies.sh not found")
-            log_error("Cannot automatically restore dependencies")
-            self.manual_actions.append(
-                "Manually install apt packages and pip packages in the container"
-            )
-            return
 
         # Start container
+        self.failed_stage = "container_start"
         log_info("Starting container with docker compose...")
         try:
             run_docker_compose(["up", "-d"], cwd=docker_dir, timeout=120)
             log_ok("Container started")
+            self.completed_stages.append("container_start")
         except DockerError as e:
             self.errors.append(f"Failed to start container: {e}")
             log_error(f"Failed to start container: {e}")
-            return
+            return False
 
-        # Get container name from compose
-        container_name = self.manifest.get("container_name")
-        if not container_name:
-            # Try to discover from compose
-            try:
-                result = run_docker_compose(
-                    ["ps", "--format", "json"],
-                    cwd=docker_dir,
-                    timeout=30,
-                )
-                import json
-                containers = json.loads(result.stdout)
-                if containers:
-                    container_name = containers[0].get("Name")
-            except (DockerError, json.JSONDecodeError):
-                pass
+        # Resolve the target container from Compose after config regeneration;
+        # the source host's recorded name may no longer apply.
+        self.failed_stage = "dependency_restore"
+        if not install_script.exists():
+            self.warnings.append("Dependency installer absent; manual restore required")
+            self.manual_actions.append(
+                "Manually install apt packages and pip packages in the container")
+            return False
+        try:
+            service = self.manifest.get("runtime_build_service")
+            args = ["ps", "-q"] + ([service] if service else [])
+            result = run_docker_compose(args, cwd=docker_dir, timeout=30)
+            container_name = next(iter(result.stdout.splitlines()), None)
+        except DockerError:
+            container_name = None
 
         if not container_name:
-            self.warnings.append("Could not determine container name")
-            log_warn("Could not determine container name for dependency restore")
-            return
+            self.errors.append("Dependency restore failed: could not determine container name")
+            log_error("Could not determine container name for dependency restore")
+            return False
 
         # Run install script in container
         log_info("Running dependency installation script...")
@@ -547,9 +648,11 @@ class BundleRestorer:
                 status="ok",
                 message="Dependencies installed via install_workspace_dependencies.sh",
             ))
+            return True
         except DockerError as e:
-            self.warnings.append(f"Dependency installation had issues: {e}")
-            log_warn(f"Dependency installation may have failed: {e}")
+            self.errors.append(f"Dependency restore failed: {e}")
+            log_error(f"Dependency restore failed: {e}")
+            return False
 
     def _dependency_script_candidates(self) -> list[str]:
         """In-container candidate paths for the dependency install script.

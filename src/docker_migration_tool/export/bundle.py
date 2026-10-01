@@ -45,6 +45,7 @@ from docker_migration_tool.security import (
 from docker_migration_tool.utils.docker import docker_save, DockerError
 from docker_migration_tool.utils.filesystem import (
     create_archive,
+    write_file_manifest,
     compute_sha256_file,
     ensure_directory,
 )
@@ -125,6 +126,9 @@ class BundleCreator:
         # Gate 1: prove the clean parent relationship (naming/env.sh is not proof)
         self._verify_parent_relationship()
 
+        # Fail before docker save if the portable build cannot be reproduced.
+        self._validate_build_context()
+
         # Gate 2: image config metadata + build history (no files involved)
         self._scan_image_config_metadata()
 
@@ -197,6 +201,14 @@ class BundleCreator:
             self.manifest.clean_base_image_id = self.inspection.clean_base_image.image_id
             self.manifest.clean_base_image_digest = self.inspection.clean_base_image.digest
             self.manifest.clean_base_image_size = self.inspection.clean_base_image.size_bytes
+            self.manifest.portable_base_image = self.manifest.clean_base_image
+        if self.inspection.runtime_build:
+            build = self.inspection.runtime_build
+            docker_dir = Path(self.inspection.docker_config.compose_yml_path).parent
+            self.manifest.runtime_image_rebuild_required = True
+            self.manifest.runtime_build_context = os.path.relpath(build["context"], docker_dir)
+            self.manifest.runtime_build_dockerfile = os.path.relpath(build["dockerfile"], build["context"])
+            self.manifest.runtime_build_service = build["service"]
 
         # Security metadata. The defaults in BundleManifest are deliberately
         # "unverified"/"not_performed": a bundle that skipped a gate must be
@@ -833,7 +845,9 @@ class BundleCreator:
         # drops exactly what the dry-run report said it would.
         excludes = self.excludes
 
-        create_archive(src_path, archive_path, excludes=excludes)
+        included_files: dict[str, str] = {}
+        excluded_files = create_archive(src_path, archive_path, excludes=excludes,
+                                        included_files=included_files)
         log_ok(f"Workspace archived: {archive_path.name}")
 
         # Compute checksum
@@ -841,19 +855,39 @@ class BundleCreator:
         self.checksums["workspace/src.tar.zst"] = sha256
         self.manifest.checksums["workspace/src.tar.zst"] = sha256
 
+        # Per-file manifest of the files the archive actually contains. Import
+        # checks the restored tree against it; excluded files are not listed,
+        # so they are never reported as missing.
+        file_manifest_path = self.output_dir / "workspace" / "src.sha256"
+        write_file_manifest(file_manifest_path, included_files)
+        file_manifest_sha256 = compute_sha256_file(file_manifest_path)
+        self.checksums["workspace/src.sha256"] = file_manifest_sha256
+        self.manifest.checksums["workspace/src.sha256"] = file_manifest_sha256
+        log_info(f"  Workspace file manifest: {len(included_files)} files, "
+                 f"{len(excluded_files or [])} excluded (see EXCLUDED_FILES.json)")
+
         # Write excluded files list
         excluded_path = self.output_dir / "workspace" / "EXCLUDED.txt"
         with open(excluded_path, "w") as f:
             f.write("# Files excluded from workspace archive\n")
             f.write("# These are either regenerable or should not be migrated\n")
+            f.write("# core_dump means regular ELF ET_CORE named core or core.<pid>\n")
             f.write(f"# Archive source: {src_path}\n\n")
             for exclude in excludes:
                 f.write(f"{exclude}\n")
 
+        audit_path = self.output_dir / "workspace" / "EXCLUDED_FILES.json"
+        with open(audit_path, "w") as f:
+            json.dump({"schema_version": "1.0.0", "files": excluded_files or []},
+                      f, indent=2)
+        audit_sha256 = compute_sha256_file(audit_path)
+        self.checksums["workspace/EXCLUDED_FILES.json"] = audit_sha256
+        self.manifest.checksums["workspace/EXCLUDED_FILES.json"] = audit_sha256
+
         # Write large files manifest. The policy is re-applied here so an
         # excluded file (e.g. a core dump) can never be recorded as included.
         included, excluded_large = partition_large_files(
-            self.inspection.large_files, excludes
+            self.inspection.large_files, excludes, src_path=src_path
         )
         for ex in excluded_large:
             log_info(f"  Large file excluded by policy: {ex.path} ({ex.excluded_by})")
@@ -984,16 +1018,7 @@ class BundleCreator:
         log_ok("Package manifests saved")
 
     def _export_docker_config(self) -> None:
-        """Export portable Docker configuration.
-
-        P0 FIX: The exported env.sh is normalized so that any
-        RUNTIME_IMAGE_TAG_OVERRIDE pointing to a source snapshot is replaced
-        with the proven clean parent image. This ensures the bundle is
-        self-consistent: import always uses the image the bundle provides.
-
-        P1 FIX: All portable config files are checksummed and recorded in
-        MANIFEST.json so bundle verify / import preflight can detect tampering.
-        """
+        """Export portable Docker configuration."""
         log_step("Exporting Docker configuration...")
 
         if not self.inspection.docker_config:
@@ -1001,6 +1026,18 @@ class BundleCreator:
             return
 
         config_dir = self.output_dir / "docker" / "config"
+
+        # Preserve the full local context tree, including custom Dockerfiles,
+        # COPY directories and scripts that are not named in a fixed allowlist.
+        # Paths outside the docker directory are restored at the same relative
+        # workspace location, so Compose's context semantics remain intact.
+        for source, relative in self._build_context_files():
+            destination = self.output_dir / relative
+            ensure_directory(destination.parent)
+            shutil.copy2(source, destination)
+            digest = compute_sha256_file(destination)
+            self.checksums[relative.as_posix()] = digest
+            self.manifest.checksums[relative.as_posix()] = digest
 
         # Copy portable files only
         portable_attrs = [
@@ -1012,18 +1049,16 @@ class BundleCreator:
             ("dockerignore_path", ".dockerignore"),
         ]
 
-        # Track which files were copied for checksumming
-        copied_files: list[tuple[str, Path]] = []
-
         for attr, filename in portable_attrs:
             src_path = getattr(self.inspection.docker_config, attr)
             if src_path and Path(src_path).exists():
-                dst_path = config_dir / filename
-                shutil.copy(src_path, dst_path)
-                copied_files.append((f"docker/config/{filename}", dst_path))
+                shutil.copy(src_path, config_dir / filename)
 
-        # P0 FIX: Normalize env.sh to use clean parent image instead of snapshot
-        self._normalize_env_sh_runtime_image(config_dir / "env.sh")
+        # Legacy runtimes use the exported clean image directly. Preserve the
+        # GitHub repository's env.sh normalization for them. A Compose-built
+        # runtime intentionally uses a different host-specific output image.
+        if not self.inspection.runtime_build:
+            self._normalize_env_sh_runtime_image(config_dir / "env.sh")
 
         # Copy udev rules
         if self.inspection.docker_config.udev_rules_path:
@@ -1077,33 +1112,20 @@ class BundleCreator:
             f.write("These files are host-specific and must be regenerated on\n")
             f.write("User B's machine by running config.sh\n")
 
-        # P1 FIX: Checksum all portable config files for integrity verification
-        self._checksum_portable_config(config_dir, copied_files)
+        # Checksum the final bytes, including normalized env.sh and every
+        # portable build-context file and helper copied above.
+        self._checksum_portable_config(config_dir)
 
         log_ok("Docker configuration saved")
 
     def _normalize_env_sh_runtime_image(self, env_sh_path: Path) -> None:
-        """Normalize env.sh so runtime image points to the clean parent.
-
-        P0 FIX: If the source env.sh has RUNTIME_IMAGE_TAG_OVERRIDE pointing to
-        a snapshot, the target would try to run an image that doesn't exist in
-        the bundle. This rewrites the file so the bundle is self-consistent.
-
-        The source_runtime_image (the snapshot) is recorded in MANIFEST.json
-        for audit purposes but is never used as a runtime target.
-        """
-        if not env_sh_path.exists():
+        """Replace a source snapshot override with the proven clean image."""
+        if not env_sh_path.exists() or not self.manifest.clean_base_image:
             return
 
         clean_image = self.manifest.clean_base_image
-        if not clean_image:
-            return
-
         content = env_sh_path.read_text(encoding="utf-8")
         original = content
-
-        # Pattern: export RUNTIME_IMAGE_TAG_OVERRIDE="..." or RUNTIME_IMAGE_TAG_OVERRIDE="..."
-        # We replace the value with the clean parent image
         patterns = [
             (r'(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*"[^"]*"',
              f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
@@ -1111,54 +1133,59 @@ class BundleCreator:
             (r"(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*'[^']*'",
              f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
              f"export RUNTIME_IMAGE_TAG_OVERRIDE='{clean_image}'"),
-            # Unquoted assignment (less common but possible)
             (r'(export\s+)?RUNTIME_IMAGE_TAG_OVERRIDE\s*=\s*(\S+)',
              f'# RUNTIME_IMAGE_TAG_OVERRIDE normalized to clean parent by docker-migration export\n'
              f'export RUNTIME_IMAGE_TAG_OVERRIDE="{clean_image}"'),
         ]
-
         for pattern, replacement in patterns:
             content, count = re.subn(pattern, replacement, content, count=1)
-            if count > 0:
+            if count:
                 break
-
         if content != original:
             env_sh_path.write_text(content, encoding="utf-8")
             log_info(f"  env.sh: normalized RUNTIME_IMAGE_TAG_OVERRIDE -> {clean_image}")
 
-    def _checksum_portable_config(self, config_dir: Path,
-                                   copied_files: list[tuple[str, Path]]) -> None:
-        """Compute and record checksums for portable config files.
+    def _checksum_portable_config(self, config_dir: Path) -> None:
+        """Checksum all final portable config bytes, including custom contexts."""
+        for path in config_dir.rglob("*"):
+            if not path.is_file() or path.name == "GENERATED_FILES_NOTE.txt":
+                continue
+            relative = path.relative_to(self.output_dir).as_posix()
+            digest = compute_sha256_file(path)
+            self.checksums[relative] = digest
+            self.manifest.checksums[relative] = digest
 
-        P1 FIX: These checksums let bundle verify and import preflight detect
-        tampering with configuration files that affect import behavior.
-        """
-        # Add checksums for the main config files
-        for rel_path, abs_path in copied_files:
-            if abs_path.exists():
-                sha256 = compute_sha256_file(abs_path)
-                self.checksums[rel_path] = sha256
-                self.manifest.checksums[rel_path] = sha256
+    def _build_context_files(self):
+        from docker_migration_tool.inspect.compose_build import build_services, context_files, BuildDependencyError
+        config = self.inspection.docker_config
+        if not config or not config.compose_yml_path:
+            return []
+        docker_dir = Path(config.compose_yml_path).parent.resolve()
+        workspace = Path(self.inspection.workspace_path).resolve()
+        files = {}
+        for build in build_services(docker_dir):
+            context = build["context"]
+            if context != workspace and workspace not in context.parents:
+                raise ExportBlockedError(f"Build context outside workspace: {context}")
+            for source in context_files(context, build["dockerfile"]) + [build["dockerfile"]]:
+                if source == docker_dir or docker_dir in source.parents:
+                    relative = Path("docker/config") / source.relative_to(docker_dir)
+                else:
+                    relative = Path("workspace/build_context") / source.relative_to(workspace)
+                files[relative.as_posix()] = (source, relative)
+        return list(files.values())
 
-        # Also checksum udev rules and scripts if present
-        extra_files = [
-            ("docker/config/udev/99-robotics-docker.rules",
-             config_dir / "udev" / "99-robotics-docker.rules"),
-            ("docker/config/install_host_udev_rules.sh",
-             config_dir / "install_host_udev_rules.sh"),
-            ("docker/config/install_user_xauthority_sync.sh",
-             config_dir / "install_user_xauthority_sync.sh"),
-            ("docker/config/xauthority/sync-robotics-xauthority.sh",
-             config_dir / "xauthority" / "sync-robotics-xauthority.sh"),
-            ("docker/config/xauthority/robotics-docker-xauthority.desktop.in",
-             config_dir / "xauthority" / "robotics-docker-xauthority.desktop.in"),
-        ]
-
-        for rel_path, abs_path in extra_files:
-            if abs_path.exists():
-                sha256 = compute_sha256_file(abs_path)
-                self.checksums[rel_path] = sha256
-                self.manifest.checksums[rel_path] = sha256
+    def _validate_build_context(self) -> None:
+        self._build_context_files()
+        config = self.inspection.docker_config
+        if config and config.compose_yml_path:
+            from docker_migration_tool.inspect.compose_build import build_services
+            selected = self.manifest.clean_base_image
+            for build in build_services(Path(config.compose_yml_path).parent):
+                if build["base"] not in {selected, "scratch"}:
+                    raise ExportBlockedError(
+                        f"Compose service {build['service']} requires build base "
+                        f"{build['base']}, which is not the exported portable image")
 
     def _export_host_info(self) -> None:
         """Export host information."""

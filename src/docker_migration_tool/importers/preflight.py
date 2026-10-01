@@ -6,6 +6,8 @@ Validates that User B's host is ready for import.
 import json
 import os
 import subprocess
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,8 +70,9 @@ class PreflightChecker:
         self._check_gpu()
         self._check_nvidia_toolkit()
         self._check_bundle_security_metadata()
-        self._check_runtime_image_consistency()  # P0 FIX
         self._validate_bundle()
+        self._check_build_dependencies()
+        self._check_runtime_image_consistency()
 
         passed = len(self.errors) == 0
         return PreflightResult(
@@ -361,6 +364,11 @@ class PreflightChecker:
         Since export now normalizes RUNTIME_IMAGE_TAG_OVERRIDE, this should pass.
         If it fails, the bundle was created by an older tool version or tampered.
         """
+        if self.manifest.get("runtime_image_rebuild_required"):
+            # A Compose build intentionally produces a target-host image whose
+            # reference differs from the portable base. The build dependency
+            # check validates its FROM edge instead.
+            return
         log_step("Checking runtime image consistency...")
 
         # Get the clean image from manifest
@@ -488,6 +496,35 @@ class PreflightChecker:
             else:
                 self.errors.append(f"Checksum mismatch: {file_path}")
                 self._add_check("checksum_" + file_path, False, "Checksum mismatch", "error")
+
+    def _check_build_dependencies(self) -> None:
+        """Reject incomplete Compose builds before any image load or restore."""
+        from docker_migration_tool.inspect.compose_build import build_services, context_files, BuildDependencyError
+        config = self.bundle_path / "docker" / "config"
+        if not (config / "docker-compose.yml").is_file():
+            return  # legacy bundles may not have a Compose project
+        try:
+            with tempfile.TemporaryDirectory(prefix="migration-preflight-") as temp:
+                root = Path(temp)
+                staged_docker = root / "docker"
+                shutil.copytree(config, staged_docker)
+                context_root = self.bundle_path / "workspace" / "build_context"
+                if context_root.exists():
+                    shutil.copytree(context_root, root, dirs_exist_ok=True)
+                builds = build_services(staged_docker, interpolate=False,
+                                        expected_base=self.manifest.get("portable_base_image"))
+                supplied = self.manifest.get("clean_base_image")
+                external = set(self.manifest.get("external_build_images", []))
+                for build in builds:
+                    context_files(build["context"], build["dockerfile"])
+                    if build["base"] not in {supplied, "scratch"} | external:
+                        raise BuildDependencyError(
+                            f"Build base {build['base']} is neither supplied by the bundle "
+                            "nor explicitly declared external")
+                self._add_check("compose_build_dependencies", True, "Build dependencies available")
+        except (BuildDependencyError, OSError, ValueError) as exc:
+            self.errors.append(str(exc))
+            self._add_check("compose_build_dependencies", False, str(exc), "error")
 
 
 def run_preflight(bundle_path: Path) -> PreflightResult:

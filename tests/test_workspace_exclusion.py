@@ -10,7 +10,9 @@ Two consistency bugs are covered here:
 No secret content is used: every path below is a dummy fixture path.
 """
 
+import io
 import json
+import shutil
 
 import pytest
 
@@ -26,6 +28,9 @@ from docker_migration_tool.inspect.workspace import (
 )
 from docker_migration_tool.model import LargeFile, MountInfo
 from docker_migration_tool.utils.filesystem import (
+    create_archive,
+    is_core_dump,
+    is_excluded,
     matched_exclude_pattern_for_relative,
 )
 
@@ -34,6 +39,11 @@ from tests.test_security_metadata import make_inspection, patch_config_scan
 
 # Well below the real 10 MB threshold so fixtures stay small
 SMALL_THRESHOLD = 1024
+
+
+def elf_core():
+    """Minimal ELF header with little-endian ET_CORE."""
+    return b"\x7fELF\x02\x01\x01" + b"\x00" * 9 + b"\x04\x00"
 
 
 @pytest.fixture
@@ -62,7 +72,8 @@ def workspace(tmp_path):
     big = SMALL_THRESHOLD * 4
     write(src / "detector_ros" / "external" / "detector" / "detector.pt", big)
     write(src / "vision_ros" / "weight" / "best.pt", big)
-    write(src / "example_bot" / "core.12345", big)
+    (src / "example_bot").mkdir(parents=True, exist_ok=True)
+    (src / "example_bot" / "core.12345").write_bytes(elf_core() + b"x" * big)
     write(src / "package" / "file.py", 10)
     write(src / "package" / "build" / "artifact.bin", big)
     write(src / "package" / "session.jsonl", big)
@@ -82,8 +93,9 @@ class TestExclusionPolicySource:
     def test_policy_contains_required_patterns(self):
         excludes = get_workspace_excludes()
         for pattern in ("**/__pycache__", "**/build", "**/install", "**/log",
-                        "core.*", "*.jsonl"):
+                        "core_dump", "*.jsonl"):
             assert pattern in excludes
+        assert "core.*" not in excludes
 
     def test_generated_files_are_part_of_the_policy(self):
         excludes = get_workspace_excludes()
@@ -98,10 +110,143 @@ class TestExclusionPolicySource:
         assert "scribbled-on" not in DEFAULT_WORKSPACE_EXCLUDES
         assert "scribbled-on" not in GENERATED_FILE_EXCLUDES
 
-    def test_core_dump_matches_core_pattern(self):
+    def test_core_dump_requires_file_inspection(self, workspace):
         assert matched_exclude_pattern_for_relative(
             "example_bot/core.12345", get_workspace_excludes()
-        ) == "core.*"
+        ) is None
+        assert is_excluded(workspace / "src/example_bot/core.12345",
+                           workspace / "src", get_workspace_excludes())
+        assert not is_excluded(workspace / "src/example_bot/core.12345",
+                               workspace / "src", [])
+
+    @pytest.mark.parametrize("name", ["core.py", "core.cpp", "core.cc", "core.c",
+        "core.h", "core.hpp", "core.rs", "core.go", "core.java", "core.js",
+        "core.ts", "core.md", "core.txt", "core.yaml", "core.yml",
+        "core.json", "core.xml", "core.launch.py", "core.sh"])
+    def test_source_named_core_is_preserved(self, tmp_path, name):
+        source = tmp_path / "src"
+        path = source / "example_pkg" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ordinary source\n")
+        assert matched_exclude_pattern_for_relative(
+            f"example_pkg/{name}", get_workspace_excludes()) is None
+        assert not is_excluded(path, source, get_workspace_excludes())
+
+    @pytest.mark.parametrize("name", ["core", "core.12345"])
+    def test_elf_core_is_excluded(self, tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes(elf_core())
+        assert is_core_dump(path)
+        assert is_excluded(path, tmp_path, get_workspace_excludes())
+
+    def test_text_with_core_pid_name_is_preserved(self, tmp_path):
+        path = tmp_path / "core.12345"
+        path.write_text("ordinary text\n")
+        assert not is_core_dump(path)
+        assert not is_excluded(path, tmp_path, get_workspace_excludes())
+
+    def test_non_core_elf_and_symlink_are_preserved(self, tmp_path):
+        executable = tmp_path / "core"
+        executable.write_bytes(elf_core()[:16] + b"\x02\x00")
+        assert not is_core_dump(executable)
+        target = tmp_path / "elsewhere"
+        target.write_bytes(elf_core())
+        link = tmp_path / "core.12345"
+        link.symlink_to(target)
+        assert not is_core_dump(link)
+
+    def test_unreadable_header_is_preserved(self, tmp_path, monkeypatch):
+        path = tmp_path / "core.12345"
+        path.write_bytes(elf_core())
+        original_open = type(path).open
+
+        def deny_candidate(candidate, *args, **kwargs):
+            if candidate == path:
+                raise PermissionError("fixture")
+            return original_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(type(path), "open", deny_candidate)
+        assert not is_core_dump(path)
+
+    def test_archive_and_audit(self, tmp_path):
+        import tarfile
+        source = tmp_path / "src" / "example_pkg"
+        source.mkdir(parents=True)
+        for name in ("core.py", "core.cpp", "core.hpp", "core.md",
+                     "core.yaml", "core.launch.py"):
+            (source / name).write_text("source\n")
+        (source / "core.12345").write_bytes(elf_core())
+        (source / "core").write_bytes(elf_core())
+        (source / "core.67890").write_text("ordinary text\n")
+        (source / "build").mkdir()
+        (source / "build" / "small.bin").write_bytes(b"x")
+        archive = tmp_path / "src.tar"
+        excluded = create_archive(tmp_path / "src", archive,
+                                  excludes=get_workspace_excludes(), compression="none")
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+        for name in ("core.py", "core.cpp", "core.hpp", "core.md",
+                     "core.yaml", "core.launch.py", "core.67890"):
+            assert f"example_pkg/{name}" in names
+        assert "example_pkg/core" not in names
+        assert "example_pkg/core.12345" not in names
+        by_path = {entry["path"]: entry for entry in excluded}
+        assert by_path["example_pkg/core.12345"]["excluded_by"] == "core_dump"
+        assert by_path["example_pkg/core.12345"]["size"] < 10 * 1024 * 1024
+        assert by_path["example_pkg/build/small.bin"]["excluded_by"] == "**/build"
+        assert "example_pkg/core.py" not in by_path
+
+    def test_big_endian_elf_core_is_excluded(self, tmp_path):
+        path = tmp_path / "core.433778"
+        path.write_bytes(b"\x7fELF\x02\x02\x01" + b"\x00" * 9 + b"\x00\x04")
+        assert is_core_dump(path)
+
+    def test_truncated_elf_header_is_preserved(self, tmp_path):
+        path = tmp_path / "core.12345"
+        path.write_bytes(b"\x7fELF")
+        assert not is_core_dump(path)
+
+    def test_incident_path_so101_core_py_is_preserved(self, tmp_path):
+        """Regression: so101_demo/core.py was silently dropped by `core.*`."""
+        source = tmp_path / "src"
+        path = source / "so101_demo" / "core.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("def run():\n    pass\n")
+        assert matched_exclude_pattern_for_relative(
+            "so101_demo/core.py", get_workspace_excludes()) is None
+        assert not is_excluded(path, source, get_workspace_excludes())
+
+    @pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd not installed")
+    def test_zstd_archive_listing(self, tmp_path):
+        """Integration with the real export format (src.tar.zst)."""
+        import subprocess
+        import tarfile
+        source = tmp_path / "src" / "example_pkg"
+        source.mkdir(parents=True)
+        (source / "core.py").write_text("source\n")
+        (source / "core.cpp").write_text("int main() { return 0; }\n")
+        (source / "core.12345").write_bytes(elf_core())
+        archive = tmp_path / "src.tar.zst"
+        create_archive(tmp_path / "src", archive, excludes=get_workspace_excludes())
+        listing = subprocess.run(["zstd", "-d", "-c", str(archive)],
+                                 check=True, capture_output=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(listing)) as tar:
+            names = set(tar.getnames())
+        assert "example_pkg/core.py" in names
+        assert "example_pkg/core.cpp" in names
+        assert "example_pkg/core.12345" not in names
+
+    def test_audit_records_metadata_only(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / ".env").write_text("DUMMY_TOKEN=fixture-value-not-a-secret\n")
+        (source / "core").write_bytes(elf_core())
+        excluded = create_archive(source, tmp_path / "src.tar",
+                                  excludes=get_workspace_excludes(), compression="none")
+        assert {entry["path"] for entry in excluded} == {".env", "core"}
+        for entry in excluded:
+            assert set(entry) == {"path", "size", "excluded_by", "reason"}
+        assert "fixture-value" not in json.dumps(excluded)
 
     def test_model_weight_is_not_excluded(self):
         assert matched_exclude_pattern_for_relative(
@@ -135,7 +280,7 @@ class TestLargeFileDiscovery:
         )
         excluded = {ex.path: ex.excluded_by for ex in discovery.excluded}
         assert "example_bot/core.12345" in excluded
-        assert excluded["example_bot/core.12345"] == "core.*"
+        assert excluded["example_bot/core.12345"] == "core_dump"
 
     def test_excluded_large_file_has_no_checksum(self, workspace):
         discovery = discover_large_files(
@@ -176,14 +321,14 @@ class TestLargeFileDiscovery:
         assert "*.jsonl" in by_pattern
         assert not any("build/artifact.bin" in ex.path for ex in discovery.excluded)
 
-    def test_partition_re_applies_policy_to_an_existing_list(self):
+    def test_partition_re_applies_policy_to_an_existing_list(self, workspace):
         included, excluded = partition_large_files([
             LargeFile(path="example_bot/core.12345", size_bytes=531_000_000),
             LargeFile(path="detector_ros/external/detector/detector.pt", size_bytes=3_371_000_000),
-        ])
+        ], src_path=workspace / "src")
         assert [lf.path for lf in included] == ["detector_ros/external/detector/detector.pt"]
         assert [ex.path for ex in excluded] == ["example_bot/core.12345"]
-        assert excluded[0].excluded_by == "core.*"
+        assert excluded[0].excluded_by == "core_dump"
 
 
 class TestDryRunAndExportShareOnePolicy:
@@ -193,6 +338,27 @@ class TestDryRunAndExportShareOnePolicy:
         creator = BundleCreator(make_inspection(), tmp_path / "bundle",
                                 dry_run=True)
         assert creator.excludes == get_workspace_excludes()
+
+    def test_export_records_every_excluded_file(self, tmp_path):
+        source = tmp_path / "workspace" / "src" / "example_pkg"
+        source.mkdir(parents=True)
+        (source / "core.py").write_text("source\n")
+        (source / "core.12345").write_bytes(elf_core())
+        (source / "session.jsonl").write_text("{}\n")
+        inspection = make_inspection()
+        inspection.workspace_path = str(tmp_path / "workspace")
+        output = tmp_path / "bundle"
+        creator = BundleCreator(inspection, output)
+        creator._create_bundle_structure()
+        creator._export_workspace()
+        audit = json.loads((output / "workspace" / "EXCLUDED_FILES.json").read_text())
+        by_path = {entry["path"]: entry for entry in audit["files"]}
+        assert audit["schema_version"] == "1.0.0"
+        assert "workspace/EXCLUDED_FILES.json" in creator.manifest.checksums
+        assert by_path["example_pkg/core.12345"]["excluded_by"] == "core_dump"
+        assert by_path["example_pkg/core.12345"]["size"] == len(elf_core())
+        assert by_path["example_pkg/session.jsonl"]["excluded_by"] == "*.jsonl"
+        assert "example_pkg/core.py" not in by_path
 
     def test_dry_run_does_not_list_excluded_large_file(self, workspace,
                                                       monkeypatch, capsys):
@@ -218,7 +384,7 @@ class TestDryRunAndExportShareOnePolicy:
         assert "detector.pt" in include_block
         assert "core.12345" not in include_block
         # The audit line may name it, but only as excluded
-        assert "core.12345" not in output or "excluded_by: core.*" in output
+        assert "core.12345" not in output or "excluded_by: core_dump" in output
 
     def test_real_archive_and_dry_run_use_identical_excludes(self, workspace,
                                                             monkeypatch):
@@ -227,7 +393,7 @@ class TestDryRunAndExportShareOnePolicy:
         seen = {}
 
         def fake_create_archive(source, archive_path, excludes=None,
-                                compression="zst"):
+                                compression="zst", included_files=None):
             seen["source"] = source
             seen["excludes"] = list(excludes or [])
             archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,7 +428,7 @@ class TestDryRunAndExportShareOnePolicy:
              / "EXCLUDED_LARGE_FILES.json").read_text()
         )
         assert audit[0]["path"] == "example_bot/core.12345"
-        assert audit[0]["excluded_by"] == "core.*"
+        assert audit[0]["excluded_by"] == "core_dump"
 
 
 class TestSrcArchiveSource:
@@ -308,7 +474,7 @@ class TestSrcArchiveSource:
         seen = {}
 
         def fake_create_archive(source, archive_path, excludes=None,
-                                compression="zst"):
+                                compression="zst", included_files=None):
             seen["source"] = source
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             archive_path.write_bytes(b"fake archive")

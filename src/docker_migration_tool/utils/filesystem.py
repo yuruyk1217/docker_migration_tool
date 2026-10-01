@@ -9,6 +9,7 @@ is what keeps the dry-run report and the real archive from disagreeing.
 import fnmatch
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -43,6 +44,9 @@ def _pattern_matches_relative(rel_path: str, pattern: str) -> bool:
     """
     rel = PurePosixPath(rel_path)
     name = rel.name
+
+    if pattern == "core_dump":
+        return False  # Requires the real file; handled by matched_exclude_pattern.
 
     if pattern.startswith("**/"):
         tail = pattern[3:]
@@ -97,7 +101,34 @@ def matched_exclude_pattern(
         rel_path = path.relative_to(root).as_posix()
     except ValueError:
         rel_path = path.name
-    return matched_exclude_pattern_for_relative(rel_path, patterns)
+    pattern = matched_exclude_pattern_for_relative(rel_path, patterns)
+    if pattern is not None:
+        return pattern
+    return "core_dump" if patterns and "core_dump" in patterns and is_core_dump(path) else None
+
+
+def is_core_dump(path: Path) -> bool:
+    """Recognize regular ELF ET_CORE files with conventional Linux core names.
+
+    An unreadable or ambiguous candidate is preserved. Symlinks are never
+    followed for this classification.
+    """
+    if not re.fullmatch(r"core(?:\.[0-9]+)?", path.name):
+        return False
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        with path.open("rb") as stream:
+            header = stream.read(18)
+    except OSError:
+        return False
+    if len(header) < 18 or header[:4] != b"\x7fELF":
+        return False
+    if header[5] == 1:  # little endian
+        return header[16:18] == b"\x04\x00"
+    if header[5] == 2:  # big endian
+        return header[16:18] == b"\x00\x04"
+    return False
 
 
 def is_excluded(path: Path, root: Path, patterns: Iterable[str] | None) -> bool:
@@ -320,7 +351,8 @@ def safe_extract_archive(archive_path: Path, dest: Path,
 
 def create_archive(source: Path, archive_path: Path,
                    excludes: list[str] | None = None,
-                   compression: str = "zst") -> None:
+                   compression: str = "zst",
+                   included_files: dict[str, str] | None = None) -> list[dict]:
     """Create a tar archive of a directory.
 
     Args:
@@ -328,13 +360,53 @@ def create_archive(source: Path, archive_path: Path,
         archive_path: Output archive path
         excludes: List of glob patterns to exclude
         compression: Compression type (none, gz, zst, xz)
+        included_files: If given, filled with relative path -> SHA-256 for
+            every regular file added to the archive
+
+    Returns:
+        Every file the policy excluded (path, size, excluded_by, reason)
     """
     excludes = excludes or []
     source = source.resolve()
 
-    def should_exclude(path: Path) -> bool:
-        """Check if path matches any exclude pattern (shared matcher)."""
-        return is_excluded(path, source, excludes)
+    excluded_files: list[dict] = []
+
+    def record_excluded(path: Path, reason: str) -> None:
+        try:
+            size = path.lstat().st_size
+        except OSError:
+            size = None
+        excluded_files.append({
+            "path": path.relative_to(source).as_posix(),
+            "size": size,
+            "excluded_by": reason,
+            "reason": "ELF core dump" if reason == "core_dump" else f"Policy: {reason}",
+        })
+
+    def add_members(tar: tarfile.TarFile) -> None:
+        for root, dirs, files in os.walk(source):
+            root_path = Path(root)
+            kept_dirs = []
+            for dirname in sorted(dirs):
+                directory = root_path / dirname
+                reason = matched_exclude_pattern(directory, source, excludes)
+                if reason is None:
+                    kept_dirs.append(dirname)
+                else:
+                    for child_root, _, child_files in os.walk(directory):
+                        for filename in sorted(child_files):
+                            record_excluded(Path(child_root) / filename, reason)
+            dirs[:] = kept_dirs
+            for filename in sorted(files):
+                path = root_path / filename
+                reason = matched_exclude_pattern(path, source, excludes)
+                if reason is not None:
+                    record_excluded(path, reason)
+                else:
+                    arcname = path.relative_to(source).as_posix()
+                    if included_files is not None and stat.S_ISREG(path.lstat().st_mode):
+                        included_files[arcname] = compute_sha256_file(path)
+                    tar.add(path, arcname=arcname)
 
     # Create tar first, then compress
     if compression == "zst":
@@ -344,17 +416,7 @@ def create_archive(source: Path, archive_path: Path,
             tar_path = archive_path.parent / (archive_path.stem.replace(".tar", "") + ".tar")
 
         with tarfile.open(tar_path, "w") as tar:
-            for root, dirs, files in os.walk(source):
-                root_path = Path(root)
-
-                # Filter excluded directories
-                dirs[:] = [d for d in dirs if not should_exclude(root_path / d)]
-
-                for file in files:
-                    file_path = root_path / file
-                    if not should_exclude(file_path):
-                        arcname = str(file_path.relative_to(source))
-                        tar.add(file_path, arcname=arcname)
+            add_members(tar)
 
         # Compress with zstd
         subprocess.run(
@@ -371,17 +433,81 @@ def create_archive(source: Path, archive_path: Path,
             mode = "w:bz2"
 
         with tarfile.open(archive_path, mode) as tar:
-            for root, dirs, files in os.walk(source):
-                root_path = Path(root)
+            add_members(tar)
+    return sorted(excluded_files, key=lambda entry: entry["path"])
 
-                # Filter excluded directories
-                dirs[:] = [d for d in dirs if not should_exclude(root_path / d)]
 
-                for file in files:
-                    file_path = root_path / file
-                    if not should_exclude(file_path):
-                        arcname = str(file_path.relative_to(source))
-                        tar.add(file_path, arcname=arcname)
+def _escape_manifest_path(path: str) -> tuple[str, str]:
+    """Escape a path the way GNU sha256sum does (prefix, escaped path)."""
+    if "\\" not in path and "\n" not in path:
+        return "", path
+    return "\\", path.replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def write_file_manifest(manifest_path: Path, entries: dict[str, str]) -> None:
+    """Write a per-file SHA-256 manifest in ``sha256sum`` format.
+
+    Paths are relative to the archived directory, so ``sha256sum -c`` works
+    from inside the restored directory.
+    """
+    with open(manifest_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        for rel_path in sorted(entries):
+            prefix, escaped = _escape_manifest_path(rel_path)
+            f.write(f"{prefix}{entries[rel_path]}  {escaped}\n")
+
+
+def read_file_manifest(manifest_path: Path) -> dict[str, str]:
+    """Read a manifest written by write_file_manifest().
+
+    Raises:
+        ValueError: If a line is malformed or a path is unsafe
+    """
+    entries: dict[str, str] = {}
+    with open(manifest_path, encoding="utf-8", errors="surrogateescape") as f:
+        for number, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            escaped = line.startswith("\\")
+            if escaped:
+                line = line[1:]
+            digest, sep, rel_path = line.partition("  ")
+            if not sep or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"Malformed manifest line {number}")
+            if escaped:
+                rel_path = re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1), rel_path)
+            parts = rel_path.split("/")
+            if rel_path.startswith("/") or ".." in parts or not rel_path:
+                raise ValueError(f"Unsafe path in manifest line {number}")
+            entries[rel_path] = digest
+    return entries
+
+
+def verify_file_manifest(root: Path, entries: dict[str, str]) -> tuple[list[str], list[str]]:
+    """Compare a restored directory with a per-file manifest.
+
+    Files present under root but absent from the manifest are not reported:
+    intentionally excluded files are never listed, and the target may already
+    hold unrelated files.
+
+    Returns:
+        (missing paths, hash-mismatched paths), each sorted
+    """
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for rel_path in sorted(entries):
+        path = root / rel_path
+        if path.is_symlink() or not path.is_file():
+            missing.append(rel_path)
+            continue
+        try:
+            actual = compute_sha256_file(path)
+        except OSError:
+            missing.append(rel_path)
+            continue
+        if actual != entries[rel_path]:
+            mismatched.append(rel_path)
+    return missing, mismatched
 
 
 def collect_files(directory: Path, excludes: list[str] | None = None) -> Iterator[Path]:

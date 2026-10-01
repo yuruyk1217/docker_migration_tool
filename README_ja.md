@@ -41,13 +41,50 @@ workspace を置きたいパスに読み替えてください。
 
 ### 0. 両方のマシンにインストールする
 
+Debian / Ubuntu では、まずホスト側の前提パッケージを入れます。
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip git zstd
+```
+
+Ubuntu 24.04 で `python3 -m venv .venv` 実行時に
+`ensurepip is not available` と表示される場合は、Python 3.12 用の venv パッケージも
+追加してください。
+
+```bash
+sudo apt install -y python3.12-venv
+```
+
+続いてリポジトリを取得し、**system Python ではなく仮想環境 `.venv` の中へ**
+`docker-migration` をインストールします。
+
 ```bash
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
-pip install -e .
 
-docker-migration --version        # CLI が PATH に入ったかの確認
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install -e .
+
+which docker-migration
+docker-migration --version
 ```
+
+`docker-migration` は `.venv` 内にインストールされるため、新しいターミナルを開いた後は
+利用前に毎回この仮想環境を有効化してください。
+
+```bash
+cd ~/docker-migration-tool
+source .venv/bin/activate
+```
+
+Ubuntu 24.04 は PEP 668 により system Python への通常の `pip install` を制限しています。
+`error: externally-managed-environment` が出た場合に
+`--break-system-packages` で回避するのではなく、上記の `.venv` を作成・有効化してください。
 
 マシン A には `docker`、`docker compose` プラグイン、`zstd`、`git` が必要です。
 マシン B には `docker` と `zstd` が必要です。また、マシン B には 60 GB 以上の空き容量を
@@ -264,8 +301,25 @@ bundle に格納されるもの。
 - **パッケージ manifest**。手動インストールした apt パッケージ、apt のバージョン、
   `pip freeze`、ROS distro と Python バージョン、および人が読む用の
   `INSTALLED_DEPENDENCIES.md`。
-- **可搬な Docker 設定**。`Dockerfile`、`docker-compose.yml`、`env.sh`、`common.sh`、
-  `config.sh`、`.dockerignore`、udev ルール、X11 authority 用スクリプト。
+- **可搬な Docker 設定と build context**。Compose 設定、custom Dockerfile、
+  `COPY`/`ADD` のローカル source（directory と `COPY .` を含む）、
+  `.dockerignore`、補助スクリプト、udev ルール、X11 authority 用スクリプト。
+  export した context file は個別に checksum を記録します。credential と生成物は
+  除外し、build が除外対象を必要とする場合は export を中止します。
+
+Compose service の runtime image が local portable base から build される場合、
+`build.context`、`build.dockerfile`、`build.args` と Dockerfile の `ARG`/`FROM` を
+解決します。RootFS layer の strict prefix を証明した base image を運び、元 runtime
+image と移行先での再 build 要否を `MANIFEST.json` に記録します。移行先では
+`config.sh` が host 設定を再生成し、`docker compose up -d` が host 固有 runtime
+image を build します。import preflight は Dockerfile、`COPY`/`ADD` source、
+bundle が供給しない local base の欠落を検出します。必須 stage が失敗すると
+`Import Incomplete` と non-zero exit status を返し、復旧用の展開済みファイルは
+保持します。`import --dry-run` は base image と再 build の予定を表示します。
+build を使わない従来型 runtime では、export が `env.sh` の
+`RUNTIME_IMAGE_TAG_OVERRIDE` を bundle 内の clean image に正規化し、import
+preflight が一致を確認します。この正規化後のファイルと custom build context を含む
+portable config は checksum で保護します。
 - **ホストとハードウェアの情報**（`host/host_info.json`、`hardware/devices.json`、
   `hardware/network.json`）。移行先と「比較」するための記録であり、値をコピーする
   ためのものではありません。
@@ -280,8 +334,9 @@ bundle に格納されるもの。
 - **X11 cookie**。移行先で再生成します。
 - **生成済みのホスト固有ファイル**。`.env`、`docker-compose.override.yml`、
   `compose.generated.yml`、`.docker.xauth` など。
-- **ビルド生成物**。`build/`、`install/`、`log/`、`__pycache__/`、`core.*` ダンプ、
+- **ビルド生成物**。`build/`、`install/`、`log/`、`__pycache__/`、`core` または `core.<pid>` という名前の ELF core dump、
   `*.jsonl` ログは workspace アーカイブから除外されます。
+  `core.py` などの通常のsourceは残ります。
 - **UID/GID、デバイスのグループ ID、`DISPLAY`、デバイスパス**。移行先で検出し、
   `config.sh` が再生成します。
 - **カメラのキャリブレーション**。外部パラメータは物理的な設置に依存するため、
@@ -320,7 +375,8 @@ bundle に格納されるもの。
 移行元・移行先の両方で必要なもの。
 
 - **Python 3.10 以降**（PEP 604 の `X | Y` 記法を使用）。サードパーティの実行時依存は
-  ありません。
+  ありません。Debian / Ubuntu では仮想環境作成用に `python3-venv` が必要です。
+  Ubuntu 24.04 では環境によって `python3.12-venv` の追加インストールが必要です。
 - **Docker Engine** と `docker compose` プラグイン、および daemon にアクセスできる
   ユーザー。両者の存在と daemon の応答は確認しますが、最低バージョンの強制はしません。
 - **`zstd`** コマンド。workspace アーカイブの圧縮・展開に使います。
@@ -333,55 +389,84 @@ bundle に格納されるもの。
 
 ## インストール
 
-### 前提パッケージ（Ubuntu / Debian）
+### Debian / Ubuntu の前提パッケージ
+
+`docker-migration-tool` 自体は Python パッケージですが、Ubuntu では system Python を
+直接変更せず、仮想環境 `.venv` にインストールすることを推奨します。
+
+まず必要なパッケージを入れます。
 
 ```bash
 sudo apt update
 sudo apt install -y python3-venv python3-pip git zstd
 ```
 
-**Ubuntu 24.04** で仮想環境の作成が `ensurepip is not available` のようなメッセージで
-失敗する場合は、バージョン固有のパッケージをインストールしてください。
+Ubuntu 24.04 は標準で Python 3.12 を使用します。仮想環境作成時に次のようなエラーが
+出る場合があります。
+
+```text
+The virtual environment was not created successfully because ensurepip is not
+available.
+```
+
+この場合は以下を追加で実行してください。
 
 ```bash
 sudo apt install -y python3.12-venv
 ```
 
-### docker-migration-tool のインストール
+### `docker-migration-tool` のインストール
 
 ```bash
-# リポジトリをクローン
 git clone <your-remote-url> docker-migration-tool
 cd docker-migration-tool
 
-# 以前の失敗した venv があれば削除
+# 以前の作成失敗で中途半端な .venv が残っている場合に備えて削除
 rm -rf .venv
 
-# 仮想環境の作成と有効化
 python3 -m venv .venv
 source .venv/bin/activate
 
-# インストール
 python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-### インストール後の使用方法
+インストール結果を確認します。
 
-CLI は仮想環境内にインストールされます。**新しいターミナルを開くたびに**、
-ツールを使用する前に仮想環境を有効化してください。
+```bash
+which python
+which pip
+which docker-migration
+docker-migration --version
+```
+
+先頭 3 つは、次のようにリポジトリ内の `.venv` を指していれば正常です。
+
+```text
+/home/<user>/docker-migration-tool/.venv/bin/python
+/home/<user>/docker-migration-tool/.venv/bin/pip
+/home/<user>/docker-migration-tool/.venv/bin/docker-migration
+```
+
+`docker-migration` は `.venv` 内にインストールされます。新しいターミナルを開いた場合は、
+利用前に毎回次を実行してください。
 
 ```bash
 cd ~/docker-migration-tool
 source .venv/bin/activate
-docker-migration --version
 ```
 
-Ubuntu 24.04 で `error: externally-managed-environment` が表示される場合は、
-仮想環境の外で `pip` を実行しています。`--break-system-packages` は
-**使用しないでください**。`.venv` を有効化して `python -m pip` を使ってください。
+Ubuntu 24.04 で次のエラーが出る場合、
 
-開発用依存関係のインストール：
+```text
+error: externally-managed-environment
+```
+
+`.venv` が有効になっていない状態で system Python の `pip` を使っています。
+`--break-system-packages` で強制インストールせず、`.venv` を作成・有効化してから
+`python -m pip` を実行してください。
+
+開発用依存関係も入れる場合は、仮想環境を有効にした状態で次を実行します。
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -526,18 +611,6 @@ workspace アーカイブの展開 → 可搬 Docker 設定の復元 → udev �
 `--non-interactive` を使います（プロンプトはスキップされ、該当する作業は手動作業として
 報告されます）。
 
-### `--workspace` の意味
-
-`--workspace` は workspace を復元する**ファイルシステム上のパス**を指定します。
-workspace の論理的な名前（identity）を変更するものではありません。移行元 manifest の
-`workspace_name` はそのまま `MANIFEST.json` に保持され、出自の追跡に使われます。
-コンテナ名や compose project 名は、復元先パスの basename ではなく、元の
-`workspace_name` から導出されます。
-
-同じ workspace を 1 台のマシン上で異なる identity で複数動かす必要がある場合は、
-import 後に `env.sh` / `docker-compose.yml` の `CONTAINER_NAME` /
-`COMPOSE_PROJECT_NAME` を手動で編集してください。
-
 ## 移行フロー
 
 ```
@@ -580,6 +653,8 @@ migration_bundle_<workspace>_<timestamp>/
 ├── workspace/
 │   ├── src.tar.zst                   # the workspace src tree
 │   ├── EXCLUDED.txt                  # exclusion policy, as applied
+│   ├── src.sha256                    # アーカイブした全ファイルの SHA-256
+│   ├── EXCLUDED_FILES.json           # 実際に除外した全ファイルのpath・size・reason
 │   ├── LARGE_FILES.json              # included large files + checksums
 │   └── EXCLUDED_LARGE_FILES.json     # large files skipped, with the pattern
 ├── git/
@@ -613,11 +688,25 @@ workspace mount は「形」で判定します。システム領域を除いた 
 名前は何でも構いません。
 
 除外ポリシーの定義は `inspect/workspace.py` の **一か所だけ** です
-（`**/__pycache__`、`**/build`、`**/install`、`**/log`、`core.*`、`*.jsonl`、および
+（`**/__pycache__`、`**/build`、`**/install`、`**/log`、`core_dump`、`*.jsonl`、および
 `.env`、`docker-compose.override.yml`、X11 authority ファイルなどの生成ファイル）。
 アーカイブ作成、大きいファイルの探索、チェックサム、dry-run レポートはすべて
 この一か所を参照するため、除外されたファイルが「含まれる大きいファイル」として
 報告されることはありません。
+
+core dumpは、`core` または `core.<pid>` という名前の通常ファイルについて
+ELF `ET_CORE` ヘッダーを確認して判定します。判定できないファイルは残します。
+`workspace/EXCLUDED_FILES.json` は、サイズを問わず実際に除外した全ファイルの
+path・size・理由を記録します。ファイル内容は記録しません。
+`core.py`、`core.cpp`、`core.hpp`、`core.md`、`core.yaml`、`core.launch.py` のような
+名前が似ているだけの通常 source（中身が text の `core.12345` も含む）は必ず
+アーカイブに含まれます。
+
+`workspace/src.sha256`（`sha256sum` 形式、`src` からの相対パス）は、アーカイブに
+入れた全通常ファイルの SHA-256 です。除外したファイルは載らないため、欠落扱いには
+なりません。import 時は復元した `src` と照合し、欠落・hash 不一致があれば該当パスを
+表示して `workspace_restored` を失敗にします。このマニフェストを持たない旧 bundle は
+互換モード（警告のみ、ファイル単位の照合なし）で復元します。
 
 ポリシーを通過した 10 MB 超のファイル（特にモデル重み）はアーカイブに含まれ、
 チェックサム付きで `workspace/LARGE_FILES.json` に記録されます。除外されたものは、
@@ -783,7 +872,7 @@ symlink による脱出、デバイスノードを拒否します。
 ## テスト
 
 ```bash
-python -m pytest                       # 308 tests
+python -m pytest                       # 296 tests
 python -m pytest --collect-only -q     # collection only
 python -m pytest tests/test_security.py
 ```

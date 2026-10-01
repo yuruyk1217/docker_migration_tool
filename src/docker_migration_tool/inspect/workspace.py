@@ -34,14 +34,13 @@ LARGE_FILE_THRESHOLD = 10 * 1024 * 1024
 #   - large-file discovery and checksums (discover_large_files below)
 #   - the dry-run report
 #
-# Duplicating this list is what previously let the dry run claim "core.* is
-# excluded" while simultaneously listing core.12345 as a large file to include.
+# Core dumps are identified by file type in the shared filesystem matcher.
 DEFAULT_WORKSPACE_EXCLUDES = [
     "**/__pycache__",
     "**/build",
     "**/install",
     "**/log",
-    "core.*",
+    "core_dump",
     "*.jsonl",
 ]
 
@@ -382,12 +381,14 @@ def find_large_files(src_path: Path, threshold: int = LARGE_FILE_THRESHOLD,
 
 def partition_large_files(
     large_files: list[LargeFile], excludes: list[str] | None = None,
+    src_path: Path | None = None,
 ) -> tuple[list[LargeFile], list[ExcludedLargeFile]]:
     """Re-apply the exclusion policy to an existing large-file list.
 
     Defensive re-check for consumers (LARGE_FILES.json, the dry-run report) so
     that a list built elsewhere can never report a file the archive drops.
-    Operates on relative paths only; no filesystem access.
+    With src_path, rechecks the real file for content-based rules. Without it,
+    only path-based rules can be applied, so ambiguous files are retained.
 
     Args:
         large_files: Large files with paths relative to the src root
@@ -401,7 +402,9 @@ def partition_large_files(
     excluded: list[ExcludedLargeFile] = []
 
     for large_file in large_files:
-        pattern = matched_exclude_pattern_for_relative(large_file.path, excludes)
+        pattern = (matched_exclude_pattern(src_path / large_file.path, src_path, excludes)
+                   if src_path is not None else
+                   matched_exclude_pattern_for_relative(large_file.path, excludes))
         if pattern is None:
             included.append(large_file)
         else:

@@ -309,12 +309,17 @@ def cmd_export(args: argparse.Namespace) -> int:
     try:
         result.runtime_image = inspect_image(result.container.image)
         docker_dir = workspace_info.get("docker_dir")
-        env_sh = f"{docker_dir}/env.sh" if docker_dir else None
-        result.clean_base_image, result.parent_relationship = (
-            resolve_clean_parent_image(
-                result.container.image, env_sh, runtime_info=result.runtime_image
+        from docker_migration_tool.inspect.compose_build import resolve_runtime_build
+        build_proof = resolve_runtime_build(Path(docker_dir), result.runtime_image) if docker_dir else None
+        if build_proof:
+            result.clean_base_image, result.parent_relationship, result.runtime_build = build_proof
+        else:
+            env_sh = f"{docker_dir}/env.sh" if docker_dir else None
+            result.clean_base_image, result.parent_relationship = (
+                resolve_clean_parent_image(
+                    result.container.image, env_sh, runtime_info=result.runtime_image
+                )
             )
-        )
     except Exception as e:
         log_error(f"Failed to inspect images: {e}")
         return 1
@@ -438,25 +443,27 @@ def cmd_import(args: argparse.Namespace) -> int:
     )
 
     if result.success:
-        # P1 FIX: Different completion message for dry-run vs real import
-        if args.dry_run:
-            log_header("Dry Run Complete")
-            log_ok(f"Planned workspace: {result.workspace_path}")
-            log_info("No changes were made")
-        else:
-            log_header("Import Complete")
-            log_ok(f"Workspace: {result.workspace_path}")
+        log_header("Import Dry Run Complete" if args.dry_run else "Import Complete")
+        log_ok(f"Target workspace: {result.workspace_path}" if args.dry_run
+               else f"Workspace: {result.workspace_path}")
 
-            if result.manual_actions_required:
-                log_warn("\nManual actions required:")
-                for action in result.manual_actions_required:
-                    log_info(f"  • {action}")
+        if result.manual_actions_required:
+            log_warn("\nManual actions required:")
+            for action in result.manual_actions_required:
+                log_info(f"  • {action}")
 
         return 0
     else:
-        log_error("Import failed")
+        log_header("Import Incomplete")
+        if result.workspace_path:
+            log_info(f"Workspace restored at: {result.workspace_path}")
+        if result.completed_stages:
+            log_info("Completed stages: " + ", ".join(result.completed_stages))
+        if result.failed_stage:
+            log_error("Failed stage: " + result.failed_stage)
         for error in result.errors:
             log_error(f"  {error}")
+        log_info("Fix the failed stage, then resume manually or rerun import.")
         return 1
 
 
@@ -520,6 +527,12 @@ def cmd_bundle_info(args: argparse.Namespace) -> int:
     log_info("")
     log_detail("Runtime image (NOT exported)", manifest.get("source_runtime_image", "unknown"))
     log_detail("Clean base image", manifest.get("clean_base_image", "unknown"))
+    log_detail("Portable base image", manifest.get("portable_base_image") or manifest.get("clean_base_image", "unknown"))
+    log_detail("Runtime rebuild required", str(manifest.get("runtime_image_rebuild_required", False)))
+    if manifest.get("runtime_build_context"):
+        log_detail("Build service", manifest.get("runtime_build_service") or "unknown")
+        log_detail("Build context", manifest["runtime_build_context"])
+        log_detail("Build Dockerfile", manifest["runtime_build_dockerfile"])
     log_detail("Base image size", f"{manifest.get('clean_base_image_size', 0) / (1024**3):.1f} GB")
 
     log_info("")
